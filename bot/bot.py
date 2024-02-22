@@ -30,10 +30,11 @@ from telegram.constants import ParseMode, ChatAction
 import config
 import database
 import openai_utils
-
+from qdrant_datastore import QdrantDataStore, Chunk, ChunkMetadata, QueryWithEmbedding
 
 # setup
 db = database.Database()
+qd_client = QdrantDataStore()
 logger = logging.getLogger(__name__)
 
 user_semaphores = {}
@@ -115,6 +116,8 @@ async def is_bot_mentioned(update: Update, context: CallbackContext):
 
          if message.chat.type == "private":
              return True
+         if message.photo and message.caption:
+             return True
 
          if message.text is not None and ("@" + context.bot.username) in message.text:
              return True
@@ -189,7 +192,14 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         return
 
     _message = message or update.message.text
-
+    image_url = None
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+        image_url = photo_file.file_path 
+        if update.message.caption:
+            _message = update.message.caption
+        else:
+            _message = "What's in this image?"
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         _message = _message.replace("@" + context.bot.username, "").strip()
@@ -203,13 +213,55 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if chat_mode == "artist":
         await generate_image_handle(update, context, message=message)
         return
+    # save message to qdrant
+    if _message.startswith('save'):
+        if update.message.reply_to_message:
+            _message = update.message.reply_to_message.text
+        else:
+            _message = _message[4:].strip()
+        chunks = [
+            Chunk(
+                text=_message,
+                metadata=ChunkMetadata(
+                    author=update.message.from_user.first_name,
+                    created_at=datetime.now().isoformat()
+                ),
+                embedding = await openai_utils.get_embedding(_message)
+            )
+        ]
+        await qd_client.upsert(chunks)
+        await update.message.reply_text("Saved")
+        return
+    # query qdrant
+    if _message.startswith('query'):
+        _message = _message[5:].strip()
+
+        query = QueryWithEmbedding(
+            query=_message,
+            top_k=3,
+            embedding=await openai_utils.get_embedding(_message),
+        )
+        query_results = await qd_client.query(queries=[query])
+        # merge result.text to one message
+        query_text = ''
+        show_query_text = ''
+        for result in query_results[0].results:
+            show_query_text += result.metadata.author + ':' + result.text[:100] + '\n'
+            query_text += result.text + '\n'
+        await update.message.reply_text(f"Query result: {show_query_text}")
+        _message = f"""
+        Leverage the top results from the knowledge database to answer the user's question. 
+        If the information directly answers the user's query, construct a response based on this information. 
+        If the knowledge database does not have the exact information required, you can utilize your inbuilt capabilities to provide a response. The top results: {query_text}, the user's query: {_message}
+        """
 
     async def message_handle_fn():
         # new dialog timeout
         if use_new_dialog_timeout:
             if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
                 db.start_new_dialog(user_id)
-                await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
+                if update.message.chat.type == 'private':
+                    await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
         db.set_user_attribute(user_id, "last_interaction", datetime.now())
 
         # in case of CancelledError
@@ -235,7 +287,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
             chatgpt_instance = openai_utils.ChatGPT(model=current_model)
             if config.enable_message_streaming:
-                gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode)
+                gen = chatgpt_instance.send_message_stream(_message, image_url=image_url, dialog_messages=dialog_messages, chat_mode=chat_mode)
             else:
                 answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
                     _message,
@@ -269,7 +321,6 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 await asyncio.sleep(0.01)  # wait a bit to avoid flooding
 
                 prev_answer = answer
-
             # update user data
             new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
             db.set_dialog_messages(
@@ -287,6 +338,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
         except Exception as e:
             error_text = f"Something went wrong during completion. Reason: {e}"
+            logger.exception(e)
             logger.error(error_text)
             await update.message.reply_text(error_text)
             return
@@ -370,7 +422,7 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
 
     try:
         image_urls = await openai_utils.generate_images(message, n_images=config.return_n_generated_images, size=config.image_size)
-    except openai.error.InvalidRequestError as e:
+    except openai.BadRequestError as e:
         if str(e).startswith("Your request was rejected as a result of our safety system"):
             text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -672,6 +724,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("help_group_chat", help_group_chat_handle, filters=user_filter))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & user_filter, message_handle))
     application.add_handler(CommandHandler("retry", retry_handle, filters=user_filter))
     application.add_handler(CommandHandler("new", new_dialog_handle, filters=user_filter))
     application.add_handler(CommandHandler("cancel", cancel_handle, filters=user_filter))

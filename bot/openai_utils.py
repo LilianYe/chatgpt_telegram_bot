@@ -1,14 +1,9 @@
 import config
-
 import tiktoken
+from openai import AsyncAzureOpenAI 
 import openai
-
-
-# setup openai
-openai.api_key = config.openai_api_key
-if config.openai_api_base is not None:
-    openai.api_base = config.openai_api_base
-
+import json 
+import numpy as np
 
 OPENAI_COMPLETION_OPTIONS = {
     "temperature": 0.7,
@@ -16,15 +11,14 @@ OPENAI_COMPLETION_OPTIONS = {
     "top_p": 1,
     "frequency_penalty": 0,
     "presence_penalty": 0,
-    "request_timeout": 60.0,
 }
-
+client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
 
 class ChatGPT:
     def __init__(self, model="gpt-3.5-turbo"):
-        assert model in {"text-davinci-003", "gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"}, f"Unknown model: {model}"
+        assert model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"}, f"Unknown model: {model}"
         self.model = model
-
+        self.map_dict = {"gpt-3.5-turbo": "gpt-35-turbo-16k", "gpt-3.5-turbo-16k": "gpt-35-turbo-16k", "gpt-4": "gpt-4"}
     async def send_message(self, message, dialog_messages=[], chat_mode="assistant"):
         if chat_mode not in config.chat_modes.keys():
             raise ValueError(f"Chat mode {chat_mode} is not supported")
@@ -35,26 +29,18 @@ class ChatGPT:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"}:
                     messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
-                    r = await openai.ChatCompletion.acreate(
-                        model=self.model,
+                    r = await client.chat.completions.create(
+                        model=self.map_dict.get(self.model, self.model),
                         messages=messages,
                         **OPENAI_COMPLETION_OPTIONS
                     )
-                    answer = r.choices[0].message["content"]
-                elif self.model == "text-davinci-003":
-                    prompt = self._generate_prompt(message, dialog_messages, chat_mode)
-                    r = await openai.Completion.acreate(
-                        engine=self.model,
-                        prompt=prompt,
-                        **OPENAI_COMPLETION_OPTIONS
-                    )
-                    answer = r.choices[0].text
+                    answer = r.choices[0].message.content
                 else:
                     raise ValueError(f"Unknown model: {self.model}")
 
                 answer = self._postprocess_answer(answer)
                 n_input_tokens, n_output_tokens = r.usage.prompt_tokens, r.usage.completion_tokens
-            except openai.error.InvalidRequestError as e:  # too many tokens
+            except openai.BadRequestError as e:  # too many tokens
                 if len(dialog_messages) == 0:
                     raise ValueError("Dialog messages is reduced to zero, but still has too many tokens to make completion") from e
 
@@ -65,7 +51,7 @@ class ChatGPT:
 
         return answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
 
-    async def send_message_stream(self, message, dialog_messages=[], chat_mode="assistant"):
+    async def send_message_stream(self, message, image_url = None, dialog_messages=[], chat_mode="assistant"):
         if chat_mode not in config.chat_modes.keys():
             raise ValueError(f"Chat mode {chat_mode} is not supported")
 
@@ -74,47 +60,34 @@ class ChatGPT:
         while answer is None:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"}:
-                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
-                    r_gen = await openai.ChatCompletion.acreate(
-                        model=self.model,
+                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode, image_url)
+                    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
+                    if image_url:
+                        client = AsyncAzureOpenAI(azure_endpoint = config.openai_v_api_base, api_key= config.openai_v_api_key, api_version='2023-05-15')
+                    r_gen = await client.chat.completions.create(
+                        model='gpt-4v' if image_url else self.map_dict.get(self.model, self.model),
                         messages=messages,
                         stream=True,
                         **OPENAI_COMPLETION_OPTIONS
                     )
-
                     answer = ""
                     async for r_item in r_gen:
+                        if len(r_item.choices) == 0:
+                            raise ValueError(f"choices is empty: {r_item}, input message: {messages}")
                         delta = r_item.choices[0].delta
-                        if "content" in delta:
+                        if delta.content:
                             answer += delta.content
                             n_input_tokens, n_output_tokens = self._count_tokens_from_messages(messages, answer, model=self.model)
                             n_first_dialog_messages_removed = n_dialog_messages_before - len(dialog_messages)
                             yield "not_finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
-                elif self.model == "text-davinci-003":
-                    prompt = self._generate_prompt(message, dialog_messages, chat_mode)
-                    r_gen = await openai.Completion.acreate(
-                        engine=self.model,
-                        prompt=prompt,
-                        stream=True,
-                        **OPENAI_COMPLETION_OPTIONS
-                    )
-
-                    answer = ""
-                    async for r_item in r_gen:
-                        answer += r_item.choices[0].text
-                        n_input_tokens, n_output_tokens = self._count_tokens_from_prompt(prompt, answer, model=self.model)
-                        n_first_dialog_messages_removed = n_dialog_messages_before - len(dialog_messages)
-                        yield "not_finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
-
                 answer = self._postprocess_answer(answer)
 
-            except openai.error.InvalidRequestError as e:  # too many tokens
+            except openai.BadRequestError as e:  # too many tokens
                 if len(dialog_messages) == 0:
                     raise e
 
                 # forget first message in dialog_messages
                 dialog_messages = dialog_messages[1:]
-
         yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed  # sending final answer
 
     def _generate_prompt(self, message, dialog_messages, chat_mode):
@@ -134,15 +107,21 @@ class ChatGPT:
 
         return prompt
 
-    def _generate_prompt_messages(self, message, dialog_messages, chat_mode):
+    def _generate_prompt_messages(self, message, dialog_messages, chat_mode, image_url=None):
         prompt = config.chat_modes[chat_mode]["prompt_start"]
 
         messages = [{"role": "system", "content": prompt}]
+        if image_url:
+            messages = []
         for dialog_message in dialog_messages:
             messages.append({"role": "user", "content": dialog_message["user"]})
             messages.append({"role": "assistant", "content": dialog_message["bot"]})
-        messages.append({"role": "user", "content": message})
-
+        if image_url:
+            content = [{"type": "text", "text": message}]
+            content.append({"type": "image_url", "image_url": {"url": image_url}})
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": message})
         return messages
 
     def _postprocess_answer(self, answer):
@@ -172,7 +151,10 @@ class ChatGPT:
         for message in messages:
             n_input_tokens += tokens_per_message
             for key, value in message.items():
-                n_input_tokens += len(encoding.encode(value))
+                if isinstance(value, list):
+                    n_input_tokens += len(encoding.encode(value[0]['text']))
+                else:
+                    n_input_tokens += len(encoding.encode(value))
                 if key == "name":
                     n_input_tokens += tokens_per_name
 
@@ -193,16 +175,36 @@ class ChatGPT:
 
 
 async def transcribe_audio(audio_file) -> str:
-    r = await openai.Audio.atranscribe("whisper-1", audio_file)
+    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
+    r = await client.audio.transcriptions.create(("whisper-1", audio_file))
     return r["text"] or ""
 
 
 async def generate_images(prompt, n_images=4, size="512x512"):
-    r = await openai.Image.acreate(prompt=prompt, n=n_images, size=size)
-    image_urls = [item.url for item in r.data]
+    client = AsyncAzureOpenAI(azure_endpoint = config.dalle_api_base, api_key= config.dalle_api_key, api_version="2023-12-01-preview")
+    r = await client.images.generate(model='dalle3', prompt=prompt, n=n_images, size=size)
+    json_response = json.loads(r.model_dump_json())
+    print(json_response)
+    image_urls = [item["url"] for item in json_response["data"]]
     return image_urls
 
+def normalize_l2(x):
+    x = np.array(x)
+    if x.ndim == 1:
+        norm = np.linalg.norm(x)
+        if norm == 0:
+            return x
+        return x / norm
+    else:
+        norm = np.linalg.norm(x, 2, axis=1, keepdims=True)
+        return np.where(norm == 0, x, x / norm)
 
-async def is_content_acceptable(prompt):
-    r = await openai.Moderation.acreate(input=prompt)
-    return not all(r.results[0].categories.values())
+async def get_embedding(text: str):
+    # Call the OpenAI API to get the embedding
+    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
+    response = await client.embeddings.create(input = text, model= "text-embedding-ada-002")
+    cut_dim = response.data[0].embedding[:config.embedding_dim]
+    norm_dim = normalize_l2(cut_dim).tolist()
+    return norm_dim
+
+

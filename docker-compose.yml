@@ -11,6 +11,19 @@ services:
       - ${MONGODB_PATH:-./mongodb}:/data/db
     # TODO: add auth
 
+  qdrant:
+    container_name: qdrant
+    image: qdrant/qdrant:latest
+    restart: always
+    ports:
+      - 127.0.0.1:6333:6333
+      - 127.0.0.1:6334:6334
+    expose:
+      - 6333
+      - 6334
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+
   chatgpt_telegram_bot:
     container_name: chatgpt_telegram_bot
     command: python3 bot/bot.py
@@ -20,7 +33,8 @@ services:
       dockerfile: Dockerfile
     depends_on:
       - mongo
-
+      - qdrant
+      
   mongo_express:
     container_name: mongo-express
     image: mongo-express:latest
