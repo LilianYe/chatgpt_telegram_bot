@@ -110,7 +110,7 @@ class ChatGPT:
     def _generate_prompt_messages(self, message, dialog_messages, chat_mode, image_url=None):
         prompt = config.chat_modes[chat_mode]["prompt_start"]
 
-        messages = [{"role": "system", "content": prompt}]
+        messages = [{"role": "system", "content": prompt}] if prompt else []
         if image_url:
             messages = []
         for dialog_message in dialog_messages:
@@ -206,5 +206,4 @@ async def get_embedding(text: str):
     cut_dim = response.data[0].embedding[:config.embedding_dim]
     norm_dim = normalize_l2(cut_dim).tolist()
     return norm_dim
-
 

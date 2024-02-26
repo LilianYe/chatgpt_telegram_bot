@@ -6,8 +6,9 @@ import html
 import json
 from datetime import datetime
 import openai
-
+import re
 import telegram
+from browser import scrape_and_convert_to_markdown
 from telegram import (
     Update,
     User,
@@ -69,7 +70,20 @@ def split_text_into_chunks(text, chunk_size):
     for i in range(0, len(text), chunk_size):
         yield text[i:i + chunk_size]
 
-
+def find_urls(string):
+    url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+    found_urls = re.findall(url_pattern, string)
+    # Filter the URLs
+    not_supported = ['https://www.ftchinese.com', 'https://x.com', 'https://weibo.com']
+    return_urls = []
+    for url in found_urls:
+        for item in not_supported:
+            if url.startswith(item):
+                break
+        else:
+            return_urls.append(url)
+    return return_urls 
+    
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
     if not db.check_if_user_exists(user.id):
         db.add_new_user(
@@ -213,6 +227,12 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if chat_mode == "artist":
         await generate_image_handle(update, context, message=message)
         return
+    # replace url with url:content
+    urls = find_urls(_message)
+    if len(urls) > 0:
+        for url in urls:
+            url_context = scrape_and_convert_to_markdown(url)[:6000]
+            _message = _message.replace(url, url + ":" + url_context)
     # save message to qdrant
     if _message.startswith('save'):
         if update.message.reply_to_message:
