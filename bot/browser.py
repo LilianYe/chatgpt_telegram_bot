@@ -1,10 +1,10 @@
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 import requests
 import html2text
 import config 
 from urllib.parse import urlparse
 from openai import AzureOpenAI
-import re
+from requests.exceptions import RequestException
 
 client = AzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
 
@@ -69,18 +69,23 @@ def scrape_and_convert_to_markdown(url, smart_mode=False):
     # make url whole
     if not url.startswith("http"):
         url = "http://" + url
-    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    if response.status_code != 200:
-        return f"Failed to fetch URL {url}"
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+    except RequestException as e:
+        return f"Failed to fetch URL {url}. Error: {str(e)}"
 
     soup = BeautifulSoup(response.text, "html.parser")
     if not soup.body:
         content_div = soup.find('div', attrs={'class': 'main clearfix'})
-        content = content_div.get_text(strip=True)
-        return content
+        if isinstance(content_div, Tag):
+            return content_div.get_text(strip=True)
+        else:
+            return "No content found"
     if url.startswith("https://www.163.com"):
         post_body = soup.find('div', {'class': 'post_body'})
         return post_body.get_text()
+
     for tag in soup.find_all(["style", "script"]):
         tag.decompose()
 
@@ -111,3 +116,24 @@ def scrape_and_convert_to_markdown(url, smart_mode=False):
         return clean_markdown(markdown)
     return markdown
 
+def link_preview(url):
+    if not url.startswith("http"):
+        url = "http://" + url
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+    except RequestException as e:
+        return f"Failed to fetch URL {url}. Error: {str(e)}"
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    preview_dict = {}
+    meta_tags = [('og:title', 'og:description'), ('twitter:title', 'twitter:description')]
+    for title_attr, desc_attr in meta_tags:
+        meta_title_tag = soup.find('meta', attrs={'name': title_attr})
+        meta_description_tag = soup.find('meta', attrs={'name': desc_attr})
+        if meta_title_tag and meta_description_tag:
+            preview_dict['title'] = meta_title_tag['content']
+            preview_dict['description'] = meta_description_tag['content']
+            break
+
+    return preview_dict

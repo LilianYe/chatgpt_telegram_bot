@@ -31,6 +31,8 @@ qdrant_port = config_yaml['qdrant_port']
 qdrant_grpc_port = config_yaml['qdrant_grpc_port']
 qdrant_collection = config_yaml['qdrant_collection']
 embedding_dim = config_yaml['embedding_dim']
+azure_blob_cs = config_yaml['azure_blob_cs']
+azure_blob_cn = config_yaml['azure_blob_cn']
 
 # chat_modes
 with open(config_dir / "chat_modes.yml", 'r') as f:

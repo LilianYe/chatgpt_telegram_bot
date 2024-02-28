@@ -9,6 +9,7 @@ import openai
 import re
 import telegram
 from browser import scrape_and_convert_to_markdown
+from blob_uploader import BlobUploader
 from telegram import (
     Update,
     User,
@@ -36,6 +37,7 @@ from qdrant_datastore import QdrantDataStore, Chunk, ChunkMetadata, QueryWithEmb
 # setup
 db = database.Database()
 qd_client = QdrantDataStore()
+uploader = BlobUploader(connect_string=config.azure_blob_cs, container_name=config.azure_blob_cn)
 logger = logging.getLogger(__name__)
 
 user_semaphores = {}
@@ -207,13 +209,26 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
     _message = message or update.message.text
     image_url = None
+    image_caption = None
+    blob_url = None
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
+        photo_file = await update.message.reply_to_message.photo[-1].get_file()
+        image_url = photo_file.file_path
+        file_extension = image_url.split('.')[-1]
+        buf = await photo_file.download_as_bytearray()
+        blob_url = uploader.upload_to_blob(buf, file_extension)
+        if update.message.reply_to_message.caption:
+            image_caption = update.message.reply_to_message.caption
     if update.message.photo:
         photo_file = await update.message.photo[-1].get_file()
-        image_url = photo_file.file_path 
+        image_url = photo_file.file_path
+        file_extension = image_url.split('.')[-1]
+        buf = await photo_file.download_as_bytearray()
+        blob_url = uploader.upload_to_blob(buf, file_extension)
         if update.message.caption:
-            _message = update.message.caption
-        else:
-            _message = "What's in this image?"
+            image_caption = update.message.caption
+    if image_caption:
+        _message += update.message.caption
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         _message = _message.replace("@" + context.bot.username, "").strip()
@@ -227,18 +242,14 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if chat_mode == "artist":
         await generate_image_handle(update, context, message=message)
         return
-    # replace url with url:content
-    urls = find_urls(_message)
-    if len(urls) > 0:
-        for url in urls:
-            url_context = scrape_and_convert_to_markdown(url)[:6000]
-            _message = _message.replace(url, url + ":" + url_context)
     # save message to qdrant
-    if _message.startswith('save'):
+    if _message and _message.startswith('save'):
+        _message = _message[4:].strip()
         if update.message.reply_to_message:
-            _message = update.message.reply_to_message.text
-        else:
-            _message = _message[4:].strip()
+            if update.message.reply_to_message.text:
+                _message = update.message.reply_to_message.text + ' ' + _message 
+            if blob_url:
+                _message += ' ' + f'image_url: {blob_url}'
         chunks = [
             Chunk(
                 text=_message,
@@ -253,7 +264,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         await update.message.reply_text("Saved")
         return
     # query qdrant
-    if _message.startswith('query'):
+    if _message and _message.startswith('query'):
         _message = _message[5:].strip()
 
         query = QueryWithEmbedding(
@@ -266,15 +277,22 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         query_text = ''
         show_query_text = ''
         for result in query_results[0].results:
-            show_query_text += result.metadata.author + ':' + result.text[:100] + '\n'
+            show_query_text += result.metadata.author + ':' + result.text[:200] + '\n'
             query_text += result.text + '\n'
         await update.message.reply_text(f"Query result: {show_query_text}")
+        query_text = query_text[:5500]
         _message = f"""
-        Leverage the top results from the knowledge database to answer the user's question. 
-        If the information directly answers the user's query, construct a response based on this information. 
-        If the knowledge database does not have the exact information required, you can utilize your inbuilt capabilities to provide a response. The top results: {query_text}, the user's query: {_message}
+        利用知识库中的最高排名结果来回答用户的问题。
+      如果数据直接回答了用户的问题，那么就根据这些信息构建一个回答。
+      如果知识库没有所需的精确信息，你可以使用你的内置能力来提供一个答案。最高排名的结果：{query_text}，用户的问题：{_message}
         """
-
+    else:
+        # replace url with url:content
+        urls = find_urls(_message)
+        if len(urls) > 0:
+            for url in urls:
+                url_context = scrape_and_convert_to_markdown(url)[:6000]
+                _message = _message.replace(url, url + ":" + url_context)
     async def message_handle_fn():
         # new dialog timeout
         if use_new_dialog_timeout:

@@ -6,3 +6,6 @@ pymongo==4.3.3
 python-dotenv==0.21.0
 qdrant-client
 arrow
+html2text
+beautifulsoup4
+azure-storage-blob
