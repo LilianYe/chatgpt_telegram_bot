@@ -261,7 +261,7 @@ class QdrantDataStore():
     ) -> ChunkWithScore:
         payload = scored_point.payload or {}
         return ChunkWithScore(
-            id=payload.get("id"),
+            id=scored_point.id,
             text=scored_point.payload.get("text"),  # type: ignore
             metadata=scored_point.payload.get("metadata"),  # type: ignore
             embedding=scored_point.vector,  # type: ignore

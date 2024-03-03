@@ -12,7 +12,12 @@ OPENAI_COMPLETION_OPTIONS = {
     "frequency_penalty": 0,
     "presence_penalty": 0,
 }
-client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
+client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, 
+                          api_key= config.openai_api_key, 
+                          api_version='2023-05-15')
+client_v = AsyncAzureOpenAI(azure_endpoint = config.openai_v_api_base, 
+                            api_key= config.openai_v_api_key, 
+                            api_version='2023-05-15')
 
 class ChatGPT:
     def __init__(self, model="gpt-3.5-turbo"):
@@ -61,15 +66,20 @@ class ChatGPT:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"}:
                     messages = self._generate_prompt_messages(message, dialog_messages, chat_mode, image_url)
-                    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
                     if image_url:
-                        client = AsyncAzureOpenAI(azure_endpoint = config.openai_v_api_base, api_key= config.openai_v_api_key, api_version='2023-05-15')
-                    r_gen = await client.chat.completions.create(
-                        model='gpt-4v' if image_url else self.map_dict.get(self.model, self.model),
+                        r_gen = await client_v.chat.completions.create(
+                        model='gpt-4v',
                         messages=messages,
                         stream=True,
                         **OPENAI_COMPLETION_OPTIONS
-                    )
+                        )
+                    else:
+                        r_gen = await client.chat.completions.create(
+                        model=self.map_dict.get(self.model, self.model),
+                        messages=messages,
+                        stream=True,
+                        **OPENAI_COMPLETION_OPTIONS
+                        )
                     answer = ""
                     async for r_item in r_gen:
                         if len(r_item.choices) == 0:
@@ -175,16 +185,16 @@ class ChatGPT:
 
 
 async def transcribe_audio(audio_file) -> str:
-    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
     r = await client.audio.transcriptions.create(("whisper-1", audio_file))
     return r["text"] or ""
 
 
 async def generate_images(prompt, n_images=4, size="512x512"):
-    client = AsyncAzureOpenAI(azure_endpoint = config.dalle_api_base, api_key= config.dalle_api_key, api_version="2023-12-01-preview")
-    r = await client.images.generate(model='dalle3', prompt=prompt, n=n_images, size=size)
+    client_i = AsyncAzureOpenAI(azure_endpoint = config.dalle_api_base, 
+                                api_key= config.dalle_api_key, 
+                                api_version="2023-12-01-preview")
+    r = await client_i.images.generate(model='dalle3', prompt=prompt, n=n_images, size=size)
     json_response = json.loads(r.model_dump_json())
-    print(json_response)
     image_urls = [item["url"] for item in json_response["data"]]
     return image_urls
 
@@ -201,9 +211,20 @@ def normalize_l2(x):
 
 async def get_embedding(text: str):
     # Call the OpenAI API to get the embedding
-    client = AsyncAzureOpenAI(azure_endpoint = config.openai_api_base, api_key= config.openai_api_key, api_version='2023-05-15')
     response = await client.embeddings.create(input = text, model= "text-embedding-ada-002")
     cut_dim = response.data[0].embedding[:config.embedding_dim]
     norm_dim = normalize_l2(cut_dim).tolist()
     return norm_dim
 
+async def get_image_des(image_url):
+    message = '为图片生成精确且简洁的描述。这些描述将用于后续的图片检索。请尽可能具体和简明，以帮助确保检索结果的效率和有效性。'
+    content = [{"type": "text", "text": message}]
+    content.append({"type": "image_url", "image_url": {"url": image_url}})
+    messages = [{"role": "user", "content": content}]
+    response = await client_v.chat.completions.create(
+                        model='gpt-4v',
+                        messages=messages,
+                        **OPENAI_COMPLETION_OPTIONS
+    )
+    image_des = response.choices[0].message.content
+    return image_des

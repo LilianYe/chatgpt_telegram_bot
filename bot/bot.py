@@ -228,7 +228,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         if update.message.caption:
             image_caption = update.message.caption
     if image_caption:
-        _message += update.message.caption
+        _message = _message + ' ' + update.message.caption if _message else update.message.caption
+    if update.message.reply_to_message and update.message.reply_to_message.text and not update.message.reply_to_message.from_user.id == context.bot.id:
+        _message = _message + ' ' + update.message.reply_to_message.text if _message else update.message.reply_to_message.text 
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         _message = _message.replace("@" + context.bot.username, "").strip()
@@ -245,11 +247,10 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     # save message to qdrant
     if _message and _message.startswith('save'):
         _message = _message[4:].strip()
-        if update.message.reply_to_message:
-            if update.message.reply_to_message.text:
-                _message = update.message.reply_to_message.text + ' ' + _message 
-            if blob_url:
-                _message += ' ' + f'image_url: {blob_url}'
+        if blob_url:
+            _message += ' ' + f'image_url: {blob_url}'
+            image_des = await openai_utils.get_image_des(blob_url)
+            _message += ' ' + image_des
         chunks = [
             Chunk(
                 text=_message,
@@ -261,7 +262,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             )
         ]
         await qd_client.upsert(chunks)
-        await update.message.reply_text("Saved")
+        await update.message.reply_text(f"Saved: {_message}")
         return
     # query qdrant
     if _message and _message.startswith('query'):
@@ -276,9 +277,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         # merge result.text to one message
         query_text = ''
         show_query_text = ''
-        for result in query_results[0].results:
+        for i, result in enumerate(query_results[0].results):
             show_query_text += result.metadata.author + ':' + result.text[:200] + '\n'
-            query_text += result.text + '\n'
+            query_text += '知识' + '{i+1}' + ': ' + result.text + '\n'
         await update.message.reply_text(f"Query result: {show_query_text}")
         query_text = query_text[:5500]
         _message = f"""
