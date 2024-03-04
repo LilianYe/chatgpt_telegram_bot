@@ -38,6 +38,7 @@ from qdrant_datastore import QdrantDataStore, Chunk, ChunkMetadata, QueryWithEmb
 db = database.Database()
 qd_client = QdrantDataStore()
 uploader = BlobUploader(connect_string=config.azure_blob_cs, container_name=config.azure_blob_cn)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 user_semaphores = {}
@@ -99,9 +100,10 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
 
     if db.get_user_attribute(user.id, "current_dialog_id") is None:
         db.start_new_dialog(user.id)
-
-    if user.id not in user_semaphores:
-        user_semaphores[user.id] = asyncio.Semaphore(1)
+    
+    user_key = update.message.chat_id if update.message.chat.type == 'supergroup' else user.id
+    if user_key not in user_semaphores:
+        user_semaphores[user_key] = asyncio.Semaphore(1)
 
     if db.get_user_attribute(user.id, "current_model") is None:
         db.set_user_attribute(user.id, "current_model", config.models["available_text_models"][0])
@@ -237,9 +239,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
     await register_user_if_not_exists(update, context, update.message.from_user)
     if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
+    is_chat_id = True if update.message.chat.type == 'supergroup' else False
+    user_id = update.message.from_user.id if not is_chat_id else update.message.chat_id
+    chat_mode = db.get_user_attribute(user_id, "current_chat_mode", is_chat_id=is_chat_id)
 
     if chat_mode == "artist":
         await generate_image_handle(update, context, message=message)
@@ -281,7 +283,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             show_query_text += result.metadata.author + ':' + result.text[:200] + '\n'
             query_text += '知识' + '{i+1}' + ': ' + result.text + '\n'
         await update.message.reply_text(f"Query result: {show_query_text}")
-        query_text = query_text[:5500]
+        query_text = query_text
         _message = f"""
         利用知识库中的最高排名结果来回答用户的问题。
       如果数据直接回答了用户的问题，那么就根据这些信息构建一个回答。
@@ -292,20 +294,21 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         urls = find_urls(_message)
         if len(urls) > 0:
             for url in urls:
-                url_context = scrape_and_convert_to_markdown(url)[:6000]
+                url_context = scrape_and_convert_to_markdown(url)
                 _message = _message.replace(url, url + ":" + url_context)
+
     async def message_handle_fn():
         # new dialog timeout
         if use_new_dialog_timeout:
-            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
-                db.start_new_dialog(user_id)
+            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction", is_chat_id=is_chat_id)).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id, is_chat_id=is_chat_id)) > 0:
+                db.start_new_dialog(user_id, is_chat_id=is_chat_id)
                 if update.message.chat.type == 'private':
                     await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
-        db.set_user_attribute(user_id, "last_interaction", datetime.now())
+        db.set_user_attribute(user_id, "last_interaction", datetime.now(), is_chat_id=is_chat_id)
 
         # in case of CancelledError
         n_input_tokens, n_output_tokens = 0, 0
-        current_model = db.get_user_attribute(user_id, "current_model")
+        current_model = db.get_user_attribute(user_id, "current_model", is_chat_id=is_chat_id)
 
         try:
             # send placeholder message to user
@@ -318,7 +321,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                  await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
                  return
 
-            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None, is_chat_id=is_chat_id)
             parse_mode = {
                 "html": ParseMode.HTML,
                 "markdown": ParseMode.MARKDOWN
@@ -364,15 +367,16 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
             db.set_dialog_messages(
                 user_id,
-                db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
-                dialog_id=None
+                db.get_dialog_messages(user_id, dialog_id=None, is_chat_id=is_chat_id) + [new_dialog_message],
+                dialog_id=None,
+                is_chat_id=is_chat_id
             )
 
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens, is_chat_id=is_chat_id)
 
         except asyncio.CancelledError:
             # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens, is_chat_id=is_chat_id)
             raise
 
         except Exception as e:
@@ -408,7 +412,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
 
-    user_id = update.message.from_user.id
+    user_id = update.message.chat_id if update.message.chat.type == 'supergroup' else update.message.from_user.id
     if user_semaphores[user_id].locked():
         text = "⏳ Please <b>wait</b> for a reply to the previous message\n"
         text += "Or you can /cancel it"
@@ -480,14 +484,14 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
 async def new_dialog_handle(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
     if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    db.start_new_dialog(user_id)
+    is_chat_id = True if update.message.chat.type == 'supergroup' else False
+    user_id = update.message.from_user.id if not is_chat_id else update.message.chat_id
+    db.set_user_attribute(user_id, "last_interaction", datetime.now(), is_chat_id=is_chat_id)
+    
+    db.start_new_dialog(user_id, is_chat_id=is_chat_id)
     await update.message.reply_text("Starting new dialog ✅")
 
-    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
+    chat_mode = db.get_user_attribute(user_id, "current_chat_mode", is_chat_id=is_chat_id)
     await update.message.reply_text(f"{config.chat_modes[chat_mode]['welcome_message']}", parse_mode=ParseMode.HTML)
 
 
